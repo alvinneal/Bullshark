@@ -25,10 +25,7 @@ pip install yfinance pandas numpy
 
 ```bash
 python -m Radiv.main                # latest signal (default)
-python -m Radiv.main --recent       # + last 10 days
-python -m Radiv.main --stats        # + signal distribution
 python -m Radiv.main --backtest     # + backtest results
-python -m Radiv.main --all          # everything
 ```
 
 ## Project Structure
