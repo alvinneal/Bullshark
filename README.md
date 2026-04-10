@@ -2,18 +2,33 @@
 
 **Built to Detect. Designed to Strike.**
 
-A Nifty 50 options signal engine that generates BUY/SELL recommendations using technical indicators. Built from the ground up as a learning project.
+Nifty 50 signal engine using a weighted scoring system across multiple technical indicators.
 
-## Current State
+## Indicators
 
-| Indicator | Status |
-|-----------|--------|
-| EMA Crossover (9/21) | ✅ Live |
-| RSI | ⬜ Next |
-| MACD | ⬜ Planned |
-| Bollinger Bands | ⬜ Planned |
-| Supertrend | ⬜ Planned |
-| VWAP | ⬜ Planned |
+| Indicator | Status | What it does |
+|-----------|--------|-------------|
+| EMA Crossover | ✅ | Trend direction via fast/slow moving average crossovers |
+| RSI | ✅ | Momentum — detects oversold/overbought conditions |
+| VWAP | ✅ | Volume-weighted fair value — price vs institutional average |
+| MACD | ⬜ | Planned |
+| Bollinger Bands | ⬜ | Planned |
+
+## How Signals Work
+
+Each indicator produces a score from -1.0 (max bearish) to +1.0 (max bullish). These are combined using configurable weights:
+
+```
+Score = (EMA × 0.40) + (RSI × 0.35) + (VWAP × 0.25)
+```
+
+| Score | Signal |
+|-------|--------|
+| ≥ +0.45 | STRONG BUY |
+| +0.15 to +0.45 | BUY |
+| -0.15 to +0.15 | HOLD |
+| -0.45 to -0.15 | SELL |
+| ≤ -0.45 | STRONG SELL |
 
 ## Setup
 
@@ -21,36 +36,39 @@ A Nifty 50 options signal engine that generates BUY/SELL recommendations using t
 pip install yfinance pandas numpy
 ```
 
-## Usage
+## Backend Usage
 
 ```bash
-python -m Radiv.main                # latest signal (default)
-python -m Radiv.main --backtest     # + backtest results
+python -m BullShark.main                    # latest signal
+python -m BullShark.main --all              # everything
+python -m BullShark.main --ema-fast 12 --ema-slow 26
+python -m BullShark.main --rsi-oversold 25 --rsi-overbought 75
+python -m BullShark.main --vwap-period 30
+python -m BullShark.main --backtest --capital 500000
+```
+
+## Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
 ```
 
 ## Project Structure
 
 ```
-Radiv/
-├── __init__.py        # package init
-├── data.py            # fetches Nifty 50 OHLCV via yfinance
-├── indicators.py      # pure indicator math (EMA, RSI, ...)
-├── signals.py         # combines indicators into BUY/SELL/HOLD
-├── backtest.py        # simulates trades on historical data
-├── display.py         # terminal output
-└── main.py            # entry point
+BullShark/
+├── __init__.py
+├── data.py            # Nifty 50 OHLCV via yfinance
+├── indicators.py      # EMA, RSI, VWAP math
+├── signals.py         # Weighted scoring system
+├── backtest.py        # Trade simulation
+├── display.py         # CLI output
+├── main.py            # Entry point
+└── frontend/          # React + Vite dashboard
 ```
-
-## How It Works
-
-1. **data.py** pulls Nifty 50 daily candles from Yahoo Finance
-2. **indicators.py** computes technical indicators on the price data
-3. **signals.py** applies trading logic to generate signals
-4. **backtest.py** simulates how those signals would have performed
-5. **display.py** formats everything for the terminal
-
-Each file has one job. Indicators don't know about signals. Signals don't know about backtesting. Backtesting doesn't know how signals are generated.
 
 ## Disclaimer
 
-This is an educational project. Not financial advice. Derivative trading carries substantial risk of loss. Always do your own research and consult a qualified financial advisor before trading.
+Educational project. Not financial advice. Derivative trading carries substantial risk.

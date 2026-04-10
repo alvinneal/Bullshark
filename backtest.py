@@ -1,164 +1,245 @@
 """
-Radiv/backtest.py
-═════════════════
-Backtesting engine. Simulates trades based on signals.
-Completely separate from signal generation.
+BullShark/backtest.py
+─────────────────────
+Enhanced backtesting engine with realistic cost modelling and
+comprehensive performance metrics.
+
+Costs modelled
+--------------
+  Brokerage   : 0.03% per trade, per side
+  STT         : 0.025% on sell-side only (Indian equity market)
+  Slippage    : 0.05% per fill (bid-ask spread simulation)
+
+Metrics reported
+----------------
+  Win rate      Profit factor     Max drawdown
+  Sharpe ratio  CAGR              Avg win / avg loss
 """
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from BullShark.display import C
 
-from Radiv.display import C
+
+_BROKERAGE  = 0.0003    # 0.03% each way
+_STT        = 0.00025   # 0.025% sell-side only (Indian equity)
+_SLIPPAGE   = 0.0005    # 0.05% per fill
+_RISK_FREE  = 0.065     # ~6.5% (Indian 10-yr Gsec yield)
 
 
-def run(
-    df: pd.DataFrame,
-    capital: float = 100_000.0,
-    stop_loss_pct: float = 2.0,
-    target_pct: float = 3.0,
-) -> dict:
+def run(df, capital=100_000.0, sl=2.0, tp=3.0,
+        brokerage=_BROKERAGE, stt=_STT, slippage=_SLIPPAGE,
+        use_atr_sl=True, sl_atr_mult=1.5, tp_rr=2.0):
     """
-    Simulate trades based on signals.
+    Simulate trades on a signal-annotated DataFrame.
 
-    Rules:
-        • Enter on BUY / STRONG BUY at next day's open.
-        • Exit on SELL / STRONG SELL, or when stop/target hit.
-        • One position at a time.
+    Parameters
+    ----------
+    df           : output of signals.generate()
+    capital      : starting capital (₹)
+    sl           : fixed stop-loss % – used only when use_atr_sl=False
+    tp           : fixed take-profit % – used only when use_atr_sl=False
+    brokerage    : fraction per side per trade
+    stt          : fraction on sell side (Indian market convention)
+    slippage     : fraction per fill
+    use_atr_sl   : True → ATR-based dynamic SL/TP (recommended)
+    sl_atr_mult  : ATR multiplier for stop-loss distance
+    tp_rr        : risk/reward ratio (TP = SL_distance × tp_rr)
 
-    Returns dict with: trades, summary, equity.
+    Returns
+    -------
+    dict with keys: trades, summary, equity_curve
     """
     valid = df[df["signal"] != "WAIT"].copy()
     if len(valid) < 2:
-        return {"trades": [], "summary": _empty(capital), "equity": pd.Series()}
+        return {"trades": [], "summary": _empty(capital), "equity_curve": [capital]}
 
-    trades = []
-    equity = []
-    cash = capital
-    pos = None
+    trades       = []
+    cash         = capital
+    pos          = None
+    equity_curve = [capital]
+
+    def _cost(price, shares, side):
+        n = price * shares
+        c = n * (brokerage + slippage)
+        if side == "sell":
+            c += n * stt
+        return c
 
     for i in range(1, len(valid)):
-        row = valid.iloc[i]
-        prev = valid.iloc[i - 1]
-        date = valid.index[i]
+        r, prev, dt = valid.iloc[i], valid.iloc[i - 1], valid.index[i]
 
-        if pos is not None:
-            hit_stop = row["low"] <= pos["stop"]
-            hit_target = row["high"] >= pos["target"]
-
-            exit_price = exit_reason = None
-
-            if hit_stop:
-                exit_price, exit_reason = pos["stop"], "stop-loss"
-            elif hit_target:
-                exit_price, exit_reason = pos["target"], "target"
+        # ── Exit logic ────────────────────────────────────────
+        if pos:
+            ep = er = None
+            if r["low"] <= pos["stop"]:
+                ep, er = pos["stop"], "sl"
+            elif r["high"] >= pos["tgt"]:
+                ep, er = pos["tgt"], "tp"
             elif prev["signal"] in ("SELL", "STRONG SELL"):
-                exit_price, exit_reason = row["open"], "signal"
+                ep, er = r["open"], "signal"
 
-            if exit_price:
-                pnl = (exit_price - pos["entry"]) * pos["shares"]
-                pnl_pct = (exit_price / pos["entry"] - 1) * 100
-                cash += exit_price * pos["shares"]
+            if ep:
+                ep_net  = ep * (1 - slippage)          # sell-side slippage
+                cost    = _cost(ep_net, pos["sh"], "sell")
+                pnl_net = (ep_net - pos["en"]) * pos["sh"] - pos["entry_cost"] - cost
+                cash   += ep_net * pos["sh"] - cost
+
                 trades.append({
-                    "entry_date": pos["date"], "exit_date": date,
-                    "entry_price": pos["entry"], "exit_price": exit_price,
-                    "shares": pos["shares"],
-                    "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2),
-                    "exit_reason": exit_reason,
+                    "ed":   pos["dt"],
+                    "xd":   dt,
+                    "ep":   pos["en"],
+                    "xp":   ep_net,
+                    "sh":   pos["sh"],
+                    "pnl":  round(pnl_net, 2),
+                    "pct":  round((ep_net / pos["en"] - 1) * 100, 2),
+                    "why":  er,
+                    "conf": pos.get("conf", 0.0),
                 })
                 pos = None
 
+        # ── Entry logic ───────────────────────────────────────
         if pos is None and prev["signal"] in ("BUY", "STRONG BUY"):
-            entry = row["open"]
-            shares = int(cash * 0.95 / entry)
-            if shares > 0:
-                cash -= entry * shares
+            en = r["open"] * (1 + slippage)   # buy at ask (slippage up)
+            sh = int(cash * 0.95 / en)
+            if sh > 0:
+                entry_cost = _cost(en, sh, "buy")
+                cash      -= en * sh + entry_cost
+
+                # Dynamic or fixed SL/TP
+                if use_atr_sl and not pd.isna(prev.get("atr", np.nan)):
+                    sl_dist  = float(prev["atr"]) * sl_atr_mult
+                    sl_price = round(en - sl_dist, 2)
+                    tp_price = round(en + sl_dist * tp_rr, 2)
+                else:
+                    sl_price = en * (1 - sl / 100)
+                    tp_price = en * (1 + tp / 100)
+
                 pos = {
-                    "entry": entry, "date": date, "shares": shares,
-                    "stop": entry * (1 - stop_loss_pct / 100),
-                    "target": entry * (1 + target_pct / 100),
+                    "en":         en,
+                    "dt":         dt,
+                    "sh":         sh,
+                    "stop":       sl_price,
+                    "tgt":        tp_price,
+                    "entry_cost": entry_cost,
+                    "conf":       float(prev.get("confidence", 0.0)),
                 }
 
-        port = cash + (row["close"] * pos["shares"] if pos else 0)
-        equity.append({"date": date, "equity": port})
+        # Mark-to-market equity (current close × held shares)
+        mtm = r["close"] * pos["sh"] if pos else 0.0
+        equity_curve.append(round(cash + mtm, 2))
 
-    # Close open position at end
+    # ── Close open position at last bar ──────────────────────
     if pos:
-        final = valid.iloc[-1]["close"]
-        pnl = (final - pos["entry"]) * pos["shares"]
-        cash += final * pos["shares"]
+        f       = valid.iloc[-1]["close"]
+        ep_net  = f * (1 - slippage)
+        cost    = _cost(ep_net, pos["sh"], "sell")
+        pnl_net = (ep_net - pos["en"]) * pos["sh"] - pos["entry_cost"] - cost
+        cash   += ep_net * pos["sh"] - cost
         trades.append({
-            "entry_date": pos["date"], "exit_date": valid.index[-1],
-            "entry_price": pos["entry"], "exit_price": final,
-            "shares": pos["shares"],
-            "pnl": round(pnl, 2),
-            "pnl_pct": round((final / pos["entry"] - 1) * 100, 2),
-            "exit_reason": "end-of-data",
+            "ed":   pos["dt"],
+            "xd":   valid.index[-1],
+            "ep":   pos["en"],
+            "xp":   ep_net,
+            "sh":   pos["sh"],
+            "pnl":  round(pnl_net, 2),
+            "pct":  round((ep_net / pos["en"] - 1) * 100, 2),
+            "why":  "open",
+            "conf": pos.get("conf", 0.0),
         })
 
-    eq = pd.DataFrame(equity).set_index("date")["equity"] if equity else pd.Series()
-    return {"trades": trades, "summary": _summarize(trades, capital, cash, eq), "equity": eq}
-
-
-# ─── DISPLAY ─────────────────────────────────────────────────────────────────
-
-def display(results: dict):
-    s = results["summary"]
-    trades = results["trades"]
-
-    print(f"  {C.BOLD}BACKTEST{C.RESET}")
-    print(f"  {'─' * 46}")
-    print(f"  Capital         ₹{s['start']:>12,.2f}")
-
-    ret_c = C.GREEN if s["return_pct"] >= 0 else C.RED
-    print(f"  Final           ₹{s['final']:>12,.2f}  {ret_c}({s['return_pct']:+.2f}%){C.RESET}")
-    print(f"  Trades          {s['total']:>5d}   W: {C.GREEN}{s['wins']}{C.RESET}  L: {C.RED}{s['losses']}{C.RESET}  ({s['win_rate']:.0f}%)")
-    print(f"  Avg Win/Loss    {C.GREEN}{s['avg_win']:+.2f}%{C.RESET} / {C.RED}{s['avg_loss']:+.2f}%{C.RESET}")
-    print(f"  Max Drawdown    {C.RED}{s['max_dd']:.2f}%{C.RESET}")
-    print()
-
-    if trades:
-        print(f"  {C.BOLD}TRADES{C.RESET}")
-        print(f"  {'─' * 46}")
-        print(f"  {C.DIM}{'Entry':<12s} {'Exit':<12s} {'P&L':>10s} {'%':>7s}  Why{C.RESET}")
-
-        for t in trades:
-            e = t["entry_date"].strftime("%Y-%m-%d") if hasattr(t["entry_date"], "strftime") else str(t["entry_date"])
-            x = t["exit_date"].strftime("%Y-%m-%d") if hasattr(t["exit_date"], "strftime") else str(t["exit_date"])
-            c = C.GREEN if t["pnl"] >= 0 else C.RED
-            print(f"  {e}  {x}  {c}₹{t['pnl']:>+9,.2f}  {t['pnl_pct']:>+6.2f}%{C.RESET}  {t['exit_reason']}")
-        print()
-
-
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-def _summarize(trades, start, final, equity):
-    if not trades:
-        return _empty(start)
-
-    pcts = [t["pnl_pct"] for t in trades]
-    wins = [p for p in pcts if p > 0]
-    losses = [p for p in pcts if p <= 0]
-
-    max_dd = 0.0
-    if len(equity) > 0:
-        peak = equity.expanding().max()
-        dd = (equity - peak) / peak * 100
-        max_dd = abs(dd.min())
+    equity_curve.append(round(cash, 2))
 
     return {
-        "start": start, "final": round(final, 2),
-        "return_pct": round((final / start - 1) * 100, 2),
-        "total": len(trades), "wins": len(wins), "losses": len(losses),
-        "win_rate": len(wins) / len(trades) * 100 if trades else 0,
-        "avg_win": round(np.mean(wins), 2) if wins else 0,
-        "avg_loss": round(np.mean(losses), 2) if losses else 0,
-        "max_dd": round(max_dd, 2),
+        "trades":       trades,
+        "summary":      _metrics(trades, capital, cash, equity_curve, df),
+        "equity_curve": equity_curve,
     }
 
 
-def _empty(capital):
+# ── Metrics ────────────────────────────────────────────────────
+
+def _metrics(trades, capital, final_cash, equity_curve, df):
+    w = [t for t in trades if t["pnl"] > 0]
+    l = [t for t in trades if t["pnl"] <= 0]
+    n = len(trades)
+
+    wr = round(len(w) / n * 100, 1) if n else 0.0
+
+    # Profit factor
+    gp = sum(t["pnl"] for t in w)
+    gl = abs(sum(t["pnl"] for t in l))
+    pf = round(gp / gl, 2) if gl > 0 else float("inf")
+
+    # Max drawdown
+    eq   = np.array(equity_curve, dtype=float)
+    peak = np.maximum.accumulate(eq)
+    dd   = (eq - peak) / np.where(peak == 0, 1, peak) * 100
+    mdd  = round(float(dd.min()), 2)
+
+    # Sharpe ratio (annualised)
+    eq_s     = pd.Series(equity_curve, dtype=float)
+    daily_r  = eq_s.pct_change().dropna()
+    rf_daily = _RISK_FREE / 252
+    sharpe   = round(
+        (daily_r.mean() - rf_daily) / daily_r.std() * np.sqrt(252), 2
+    ) if daily_r.std() > 0 else 0.0
+
+    # CAGR
+    n_years = max(len(df) / 252, 0.01)
+    cagr    = round(((final_cash / capital) ** (1 / n_years) - 1) * 100, 2)
+
+    ret = round((final_cash / capital - 1) * 100, 2)
+
     return {
-        "start": capital, "final": capital, "return_pct": 0,
-        "total": 0, "wins": 0, "losses": 0, "win_rate": 0,
-        "avg_win": 0, "avg_loss": 0, "max_dd": 0,
+        "start":  capital,
+        "final":  round(final_cash, 2),
+        "ret":    ret,
+        "cagr":   cagr,
+        "n":      n,
+        "w":      len(w),
+        "l":      len(l),
+        "wr":     wr,
+        "aw":     round(np.mean([t["pct"] for t in w]), 2) if w else 0.0,
+        "al":     round(np.mean([t["pct"] for t in l]), 2) if l else 0.0,
+        "pf":     pf,
+        "mdd":    mdd,
+        "sharpe": sharpe,
+    }
+
+
+def display(results):
+    s  = results["summary"]
+    rc = C.G if s["ret"] >= 0 else C.RD
+
+    print(f"  {C.B}BACKTEST{C.R}  "
+          f"Rs.{s['start']:,.0f} -> Rs.{s['final']:,.0f} "
+          f"{rc}({s['ret']:+.2f}%){C.R}  "
+          f"CAGR {rc}{s['cagr']:+.2f}%{C.R}")
+    print(f"  Trades: {s['n']}  "
+          f"Win: {C.G}{s['w']}{C.R}  "
+          f"Loss: {C.RD}{s['l']}{C.R}  "
+          f"Rate: {s['wr']}%  "
+          f"Avg W/L: {C.G}{s['aw']:+.2f}%{C.R}/{C.RD}{s['al']:+.2f}%{C.R}")
+    pf_c = C.G if s["pf"] > 1 else C.RD
+    sh_c = C.G if s["sharpe"] > 1 else C.Y
+    print(f"  Profit Factor: {pf_c}{s['pf']}{C.R}  "
+          f"Max Drawdown: {C.RD}{s['mdd']:.2f}%{C.R}  "
+          f"Sharpe: {sh_c}{s['sharpe']}{C.R}\n")
+
+    for t in results["trades"]:
+        e = t["ed"].strftime("%Y-%m-%d") if hasattr(t["ed"], "strftime") else str(t["ed"])
+        x = t["xd"].strftime("%Y-%m-%d") if hasattr(t["xd"], "strftime") else str(t["xd"])
+        tc = C.G if t["pnl"] >= 0 else C.RD
+        print(f"  {e}->{x}  "
+              f"{tc}Rs.{t['pnl']:>+9,.2f} ({t['pct']:>+.2f}%){C.R}  "
+              f"{t['why']}")
+    print()
+
+
+def _empty(c):
+    return {
+        "start": c, "final": c, "ret": 0.0, "cagr": 0.0,
+        "n": 0, "w": 0, "l": 0, "wr": 0.0,
+        "aw": 0.0, "al": 0.0, "pf": 0.0, "mdd": 0.0, "sharpe": 0.0,
     }

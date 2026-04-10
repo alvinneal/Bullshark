@@ -1,101 +1,112 @@
-"""
-Radiv/display.py
-════════════════
-Clean terminal output. All printing lives here.
-"""
-
+import numpy as np
 import pandas as pd
 
 
 class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    DIM    = "\033[2m"
-    GREEN  = "\033[32m"
-    RED    = "\033[31m"
-    YELLOW = "\033[33m"
-    CYAN   = "\033[36m"
+    R  = "\033[0m"
+    B  = "\033[1m"
+    D  = "\033[2m"
+    G  = "\033[32m"
+    RD = "\033[31m"
+    Y  = "\033[33m"
+    CN = "\033[36m"
+    MG = "\033[35m"
 
 
-SIGNAL_STYLE = {
-    "STRONG BUY":  (C.GREEN + C.BOLD, "▲▲"),
-    "BUY":         (C.GREEN,          "▲ "),
-    "HOLD":        (C.YELLOW,         "── "),
-    "SELL":        (C.RED,            "▼ "),
-    "STRONG SELL": (C.RED + C.BOLD,   "▼▼"),
-    "WAIT":        (C.DIM,            "·· "),
+SIG = {
+    "STRONG BUY":  (C.G  + C.B, "^^"),
+    "BUY":         (C.G,        "^ "),
+    "HOLD":        (C.Y,        "-- "),
+    "SELL":        (C.RD,       "v "),
+    "STRONG SELL": (C.RD + C.B, "vv"),
+    "WAIT":        (C.D,        ".. "),
+}
+
+REGIME_C = {
+    "TRENDING": C.G,
+    "NEUTRAL":  C.Y,
+    "RANGING":  C.RD,
+    "VOLATILE": C.MG,
+    "UNKNOWN":  C.D,
 }
 
 
-def header(ema_fast: int = 9, ema_slow: int = 21, interval: str = "1d", period: str = "1y"):
-    settings = f"EMA {ema_fast}/{ema_slow}  ·  {interval} candles  ·  {period}"
-    print(f"""
-{C.CYAN}{C.BOLD}  R A D I V{C.RESET}  {C.DIM}Your Radar for Derivatives{C.RESET}
-  {C.DIM}Nifty 50  ·  {settings}{C.RESET}
-""")
+def header(cfg, interval="1d", period="1y"):
+    print(f"\n{C.CN}{C.B}  B U L L S H A R K{C.R}  "
+          f"{C.D}Built to Detect. Designed to Strike.{C.R}")
+    print(f"  {C.D}Nifty 50 | EMA {cfg['ema_fast']}/{cfg['ema_slow']} | "
+          f"RSI {cfg['rsi_period']} | VWAP {cfg['vwap_period']} | "
+          f"ADX {cfg.get('adx_period', 14)} | ATR {cfg.get('atr_period', 14)} | "
+          f"{interval} | {period}{C.R}\n")
 
 
-def latest(df: pd.DataFrame, ema_fast: int = 9, ema_slow: int = 21):
-    row = df.iloc[-1]
-    prev = df.iloc[-2]
-    change_pct = (row["close"] / prev["close"] - 1) * 100
-    gap_pct = (row["ema_fast"] - row["ema_slow"]) / row["ema_slow"] * 100
+def latest(df, cfg):
+    r, p = df.iloc[-1], df.iloc[-2]
+    chg  = (r["close"] / p["close"] - 1) * 100
+    s, a = SIG.get(r["signal"], (C.Y, "?"))
+    rc   = REGIME_C.get(r.get("regime", "UNKNOWN"), C.D)
+    conf = r.get("confidence", 0.0)
+    htf  = r.get("htf_trend", "UNKNOWN")
 
-    style, arrow = SIGNAL_STYLE.get(row["signal"], (C.YELLOW, "?"))
-    date_str = df.index[-1].strftime("%Y-%m-%d")
+    print(f"  {df.index[-1].strftime('%Y-%m-%d')}  "
+          f"Rs.{r['close']:,.2f} ({chg:+.2f}%)  "
+          f"Score: {r['score']:+.3f}  "
+          f"Confidence: {C.CN}{conf:.1f}%{C.R}")
+    print(f"  EMA {cfg['ema_fast']}/{cfg['ema_slow']}  "
+          f"Rs.{r['ema_fast']:,.2f} / Rs.{r['ema_slow']:,.2f}  "
+          f"gap: {r['ema_gap']:+.2f}%")
+    print(f"  RSI {r['rsi']:.1f}  |  "
+          f"VWAP Rs.{r['vwap']:,.2f}  dist: {r['vwap_dist']:+.2f}%")
+    atr_pct = r.get("atr_pct", np.nan)
+    print(f"  ADX {r['adx']:.1f}  |  "
+          f"ATR Rs.{r['atr']:,.2f} ({atr_pct:.2f}%)  |  "
+          f"Regime: {rc}{r.get('regime', '?')}{C.R}  |  "
+          f"HTF: {htf}")
+    print(f"  {s}{a} {r['signal']}{C.R}  {C.D}{r['reason']}{C.R}")
 
-    print(f"  {C.BOLD}LATEST{C.RESET}  {C.DIM}{date_str}{C.RESET}")
-    print(f"  {'─' * 46}")
-    print(f"  Close        {C.BOLD}₹{row['close']:>10,.2f}{C.RESET}  ({change_pct:+.2f}%)")
-    print(f"  EMA {ema_fast:<8d} ₹{row['ema_fast']:>10,.2f}")
-    print(f"  EMA {ema_slow:<8d} ₹{row['ema_slow']:>10,.2f}   gap: {gap_pct:+.2f}%")
-
-    if row["bullish_cross"]:
-        print(f"               {C.GREEN}★ Bullish crossover today{C.RESET}")
-    elif row["bearish_cross"]:
-        print(f"               {C.RED}★ Bearish crossover today{C.RESET}")
-
-    print()
-    print(f"  Signal       {style}{arrow} {row['signal']}{C.RESET}")
-    print(f"  {C.DIM}{row['reason']}{C.RESET}")
-    print()
+    # Trade levels (only for actionable signals)
+    sl  = r.get("stop_loss", np.nan)
+    tgt = r.get("take_profit", np.nan)
+    if r["signal"] in ("BUY", "STRONG BUY", "SELL", "STRONG SELL") \
+            and not pd.isna(sl):
+        print(f"  Entry: Rs.{r['close']:,.2f}  "
+              f"SL: {C.RD}Rs.{sl:,.2f}{C.R}  "
+              f"TP: {C.G}Rs.{tgt:,.2f}{C.R}\n")
+    else:
+        print()
 
 
-def recent(df: pd.DataFrame, n: int = 10):
-    tail = df.tail(n)
-    print(f"  {C.BOLD}RECENT{C.RESET}  (last {n} bars)")
-    print(f"  {'─' * 46}")
-    print(f"  {C.DIM}{'Date':<12s} {'Close':>10s} {'EMA gap':>8s}  Signal{C.RESET}")
-
-    for idx, row in tail.iterrows():
-        date_str = idx.strftime("%Y-%m-%d")
-        gap = (row["ema_fast"] - row["ema_slow"]) / row["ema_slow"] * 100
-        style, arrow = SIGNAL_STYLE.get(row["signal"], (C.YELLOW, "?"))
-
+def recent(df, n=10):
+    for dt, r in df.tail(n).iterrows():
+        s, a   = SIG.get(r["signal"], (C.Y, "?"))
+        rc     = REGIME_C.get(r.get("regime", "UNKNOWN"), C.D)
+        conf   = r.get("confidence", 0.0)
+        regime = r.get("regime", "?")[:7]
         print(
-            f"  {date_str}  ₹{row['close']:>9,.2f} "
-            f"{gap:>+7.2f}%  {style}{arrow} {row['signal']}{C.RESET}"
+            f"  {dt.strftime('%Y-%m-%d')}  "
+            f"Rs.{r['close']:>9,.2f}  "
+            f"RSI {r['rsi']:>5.1f}  "
+            f"VWAP {r['vwap_dist']:>+5.2f}%  "
+            f"ADX {r['adx']:>4.1f}  "
+            f"{rc}{regime:<7}{C.R}  "
+            f"{r['score']:>+.3f}  "
+            f"{C.CN}{conf:>4.0f}%{C.R}  "
+            f"{s}{a}{r['signal']}{C.R}"
         )
     print()
 
 
-def stats(df: pd.DataFrame):
-    valid = df[df["signal"] != "WAIT"]
-    counts = valid["signal"].value_counts()
-    total = len(valid)
-
-    print(f"  {C.BOLD}STATS{C.RESET}  ({total} trading days)")
-    print(f"  {'─' * 46}")
-
+def stats(df):
+    v = df[df["signal"] != "WAIT"]
+    c = v["signal"].value_counts()
+    t = len(v)
     for sig in ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]:
-        c = counts.get(sig, 0)
-        pct = c / total * 100 if total else 0
-        bar = "█" * int(pct / 2.5)
-        style, _ = SIGNAL_STYLE.get(sig, (C.YELLOW, ""))
-        print(f"  {style}{sig:<12s}{C.RESET}  {c:>4d}  ({pct:>5.1f}%)  {C.DIM}{bar}{C.RESET}")
+        n   = c.get(sig, 0)
+        pct = n / t * 100 if t else 0
+        st, _ = SIG.get(sig, (C.Y, ""))
+        print(f"  {st}{sig:<12s}{C.R} {n:>4d} ({pct:>5.1f}%)")
     print()
 
 
 def disclaimer():
-    print(f"  {C.DIM}⚠  Educational only. Not financial advice.{C.RESET}")
-    print()
+    print(f"  {C.D}[!] Educational only. Not financial advice.{C.R}\n")
